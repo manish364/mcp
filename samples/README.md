@@ -28,6 +28,10 @@ The samples in this directory provide:
 
 ## Available Samples
 
+### HealthImaging MCP Server Examples
+
+Comprehensive examples demonstrating all 39 tools provided by the AWS HealthImaging MCP Server, including 21 standard AWS API operations and 18 advanced DICOM operations. Covers medical imaging workflows, supports compliance with "right to be forgotten/right to erasure" GDPR objectives, bulk operations, and clinical data analysis. Code can be found in the [healthimaging-mcp-server-examples](https://github.com/awslabs/mcp/tree/main/samples/healthimaging-mcp-server-examples) folder.
+
 ### MCP Integration with KB
 
 A client that integrates with the Amazon Bedrock Knowledge Base MCP server. Code can be found in the [mcp-integration-with-kb](https://github.com/awslabs/mcp/tree/main/samples/mcp-integration-with-kb) folder.

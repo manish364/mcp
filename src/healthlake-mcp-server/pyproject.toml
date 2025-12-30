@@ -53,7 +53,7 @@ repository = "https://github.com/awslabs/mcp.git"
 changelog = "https://github.com/awslabs/mcp/blob/main/src/healthlake-mcp-server/CHANGELOG.md"
 
 [project.scripts]
-"awslabs.healthlake-mcp-server" = "awslabs.healthlake_mcp_server.main:sync_main"
+"awslabs.healthlake-mcp-server" = "awslabs.healthlake_mcp_server.server:main"
 
 [dependency-groups]
 dev = [

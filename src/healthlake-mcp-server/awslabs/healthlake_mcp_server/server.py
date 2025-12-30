@@ -14,10 +14,8 @@
 
 """AWS HealthLake MCP Server implementation."""
 
-# Standard library imports
+import argparse
 import json
-
-# Local imports
 from .fhir_operations import MAX_SEARCH_COUNT, HealthLakeClient, validate_datastore_id
 from .models import (
     CreateResourceRequest,
@@ -27,34 +25,67 @@ from .models import (
     JobFilter,
     UpdateResourceRequest,
 )
-
-# Third-party imports
 from botocore.exceptions import ClientError, NoCredentialsError
 from datetime import datetime
 from loguru import logger
-from mcp.server import Server
-from mcp.types import Resource, TextContent, Tool
-from pydantic import AnyUrl
-from typing import Any, Dict, List, Sequence
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult, Resource, TextContent
+from pydantic import AnyUrl, Field
+from typing import Any, Dict, List, Optional
 
 
-# Tool categories for read-only mode
-READ_ONLY_TOOLS = {
-    'list_datastores',
-    'get_datastore_details',
-    'read_fhir_resource',
-    'search_fhir_resources',
-    'patient_everything',
-    'list_fhir_jobs',
-}
+# Server configuration
+SERVER_INSTRUCTIONS = """
+# AWS HealthLake MCP Server
 
-WRITE_TOOLS = {
-    'create_fhir_resource',
-    'update_fhir_resource',
-    'delete_fhir_resource',
-    'start_fhir_import_job',
-    'start_fhir_export_job',
-}
+This MCP server provides tools for AWS HealthLake FHIR operations with comprehensive resource management capabilities.
+
+## IMPORTANT: Use MCP Tools for HealthLake Operations
+
+DO NOT use standard AWS CLI commands (aws healthlake). Always use the MCP tools provided by this server for HealthLake operations.
+
+## Usage Notes
+
+- By default, the server runs in read-only mode. Use the `--allow-write` flag to enable write operations.
+- The server automatically discovers HealthLake datastores as MCP resources.
+- All tools support comprehensive error handling with structured responses.
+- Search operations support advanced FHIR search parameters including chaining, includes, and modifiers.
+
+## Common Workflows
+
+### Basic Resource Management
+1. List datastores: `list_datastores()`
+2. Get datastore details: `get_datastore_details(datastore_id='your-datastore-id')`
+3. Create a resource: `create_fhir_resource(datastore_id='...', resource_type='Patient', resource_data={...})`
+4. Read a resource: `read_fhir_resource(datastore_id='...', resource_type='Patient', resource_id='...')`
+5. Update a resource: `update_fhir_resource(datastore_id='...', resource_type='Patient', resource_id='...', resource_data={...})`
+6. Delete a resource: `delete_fhir_resource(datastore_id='...', resource_type='Patient', resource_id='...')`
+
+### Advanced Search Operations
+1. Basic search: `search_fhir_resources(datastore_id='...', resource_type='Patient', search_params={'name': 'Smith'})`
+2. Advanced search with includes: `search_fhir_resources(datastore_id='...', resource_type='Patient', search_params={'name:contains': 'smith'}, include_params=['Patient:general-practitioner'])`
+3. Patient everything: `patient_everything(datastore_id='...', patient_id='...', start='2023-01-01', end='2023-12-31')`
+
+### Job Management
+1. Start import job: `start_fhir_import_job(datastore_id='...', input_data_config={...}, job_output_data_config={...}, data_access_role_arn='...')`
+2. Start export job: `start_fhir_export_job(datastore_id='...', output_data_config={...}, data_access_role_arn='...')`
+3. List jobs: `list_fhir_jobs(datastore_id='...', job_status='COMPLETED', job_type='IMPORT')`
+
+## Best Practices
+
+- Use descriptive resource names and proper FHIR resource structures.
+- Leverage the automatic datastore discovery through MCP resources.
+- Use advanced search parameters for efficient data retrieval.
+- Monitor job status when performing import/export operations.
+- Follow FHIR R4 specifications for resource structures.
+"""
+
+SERVER_DEPENDENCIES = [
+    'pydantic',
+    'loguru',
+    'boto3',
+    'botocore',
+]
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -80,526 +111,433 @@ def validate_count(count: int) -> int:
     return count
 
 
-def create_error_response(message: str, error_type: str = 'error') -> List[TextContent]:
+def create_error_response(message: str, error_type: str = 'error') -> CallToolResult:
     """Create standardized error response."""
-    return [
-        TextContent(
-            type='text',
-            text=json.dumps({'error': True, 'type': error_type, 'message': message}, indent=2),
-        )
-    ]
+    return CallToolResult(
+        isError=True,
+        content=[
+            TextContent(
+                type='text',
+                text=json.dumps({'error': True, 'type': error_type, 'message': message}, indent=2),
+            )
+        ],
+    )
 
 
-def create_success_response(data: Any) -> List[TextContent]:
+def create_success_response(data: Any) -> CallToolResult:
     """Create standardized success response."""
-    return [TextContent(type='text', text=json.dumps(data, indent=2, cls=DateTimeEncoder))]
+    return CallToolResult(
+        content=[TextContent(type='text', text=json.dumps(data, indent=2, cls=DateTimeEncoder))]
+    )
 
 
-class ToolHandler:
-    """Handles tool dispatch and execution."""
+class HealthLakeHandler:
+    """Handler for HealthLake operations in the MCP Server."""
 
-    def __init__(self, healthlake_client: HealthLakeClient, read_only: bool = False):
-        """Initialize tool handler with HealthLake client and read-only mode support."""
-        self.client = healthlake_client
+    def __init__(self, mcp: FastMCP, read_only: bool = False):
+        """Initialize the HealthLake handler.
+
+        Args:
+            mcp: The FastMCP server instance
+            read_only: Whether to enable read-only mode (default: False)
+        """
+        self.mcp = mcp
+        self.client = HealthLakeClient()
         self.read_only = read_only
 
-        # Define all possible handlers
-        all_handlers = {
-            'list_datastores': self._handle_list_datastores,
-            'get_datastore_details': self._handle_get_datastore,
-            'create_fhir_resource': self._handle_create,
-            'read_fhir_resource': self._handle_read,
-            'update_fhir_resource': self._handle_update,
-            'delete_fhir_resource': self._handle_delete,
-            'search_fhir_resources': self._handle_search,
-            'patient_everything': self._handle_patient_everything,
-            'start_fhir_import_job': self._handle_import_job,
-            'start_fhir_export_job': self._handle_export_job,
-            'list_fhir_jobs': self._handle_list_jobs,
-        }
+        # Register all tools
+        self._register_tools()
 
-        # Filter handlers based on read-only mode
-        if read_only:
-            self.handlers = {k: v for k, v in all_handlers.items() if k in READ_ONLY_TOOLS}
-        else:
-            self.handlers = all_handlers
+        # Register resources
+        self.mcp.resource('healthlake://datastore/{datastore_id}')(self._read_datastore_resource)
 
-    async def handle_tool(self, name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-        """Dispatch tool call to appropriate handler with read-only safety check."""
-        if name not in self.handlers:
-            if self.read_only and name in WRITE_TOOLS:
-                raise ValueError(f'Tool {name} not available in read-only mode')
+    def _register_tools(self):
+        """Register all HealthLake tools with the MCP server."""
+        # Datastore management tools (always available)
+        self.mcp.tool(name='list_datastores')(self.list_datastores)
+        self.mcp.tool(name='get_datastore_details')(self.get_datastore_details)
+
+        # Read-only FHIR operations (always available)
+        self.mcp.tool(name='read_fhir_resource')(self.read_fhir_resource)
+        self.mcp.tool(name='search_fhir_resources')(self.search_fhir_resources)
+        self.mcp.tool(name='patient_everything')(self.patient_everything)
+        self.mcp.tool(name='list_fhir_jobs')(self.list_fhir_jobs)
+
+        # Write operations (only if not read-only)
+        if not self.read_only:
+            self.mcp.tool(name='create_fhir_resource')(self.create_fhir_resource)
+            self.mcp.tool(name='update_fhir_resource')(self.update_fhir_resource)
+            self.mcp.tool(name='delete_fhir_resource')(self.delete_fhir_resource)
+            self.mcp.tool(name='start_fhir_import_job')(self.start_fhir_import_job)
+            self.mcp.tool(name='start_fhir_export_job')(self.start_fhir_export_job)
+
+    def _check_write_access(self, operation_name: str) -> None:
+        """Check if write access is allowed for the given operation."""
+        if self.read_only:
+            raise ValueError(
+                f'Operation {operation_name} not available in read-only mode. '
+                'Remove --readonly flag to enable write operations.'
+            )
+
+    async def _read_datastore_resource(self, uri: AnyUrl) -> str:
+        """Read detailed datastore information."""
+        uri_str = str(uri)
+        if not uri_str.startswith('healthlake://datastore/'):
+            raise ValueError(f'Unknown resource URI: {uri_str}')
+        datastore_id = uri_str.split('/')[-1]
+        result = await self.client.get_datastore_details(datastore_id)
+        return json.dumps(result, indent=2, cls=DateTimeEncoder)
+
+    async def list_datastores(
+        self,
+        ctx: Context,
+        status: Optional[str] = Field(
+            None,
+            description='Filter datastores by status (CREATING, ACTIVE, DELETING, DELETED)',
+        ),
+    ) -> CallToolResult:
+        """List all HealthLake datastores in the account."""
+        try:
+            filter_obj = DatastoreFilter(status=status)
+            result = await self.client.list_datastores(filter_status=filter_obj.status)
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error listing datastores: {e}')
+            return self._handle_error(e, 'list_datastores')
+
+    async def get_datastore_details(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+    ) -> CallToolResult:
+        """Get detailed information about a specific HealthLake datastore."""
+        try:
+            datastore_id = validate_datastore_id(datastore_id)
+            result = await self.client.get_datastore_details(datastore_id=datastore_id)
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error getting datastore details: {e}')
+            return self._handle_error(e, 'get_datastore_details')
+
+    async def create_fhir_resource(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        resource_type: str = Field(..., description='FHIR resource type'),
+        resource_data: Dict[str, Any] = Field(
+            ..., description='FHIR resource data as JSON object'
+        ),
+    ) -> CallToolResult:
+        """Create a new FHIR resource in HealthLake."""
+        try:
+            self._check_write_access('create_fhir_resource')
+            request = CreateResourceRequest(
+                datastore_id=datastore_id, resource_type=resource_type, resource_data=resource_data
+            )
+            result = await self.client.create_resource(
+                datastore_id=request.datastore_id,
+                resource_type=request.resource_type,
+                resource_data=request.resource_data,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error creating FHIR resource: {e}')
+            return self._handle_error(e, 'create_fhir_resource')
+
+    async def read_fhir_resource(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        resource_type: str = Field(..., description='FHIR resource type'),
+        resource_id: str = Field(..., description='FHIR resource ID'),
+    ) -> CallToolResult:
+        """Get a specific FHIR resource by ID."""
+        try:
+            datastore_id = validate_datastore_id(datastore_id)
+            result = await self.client.read_resource(
+                datastore_id=datastore_id, resource_type=resource_type, resource_id=resource_id
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error reading FHIR resource: {e}')
+            return self._handle_error(e, 'read_fhir_resource')
+
+    async def update_fhir_resource(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        resource_type: str = Field(..., description='FHIR resource type'),
+        resource_id: str = Field(..., description='FHIR resource ID'),
+        resource_data: Dict[str, Any] = Field(
+            ..., description='Updated FHIR resource data as JSON object'
+        ),
+    ) -> CallToolResult:
+        """Update an existing FHIR resource in HealthLake."""
+        try:
+            self._check_write_access('update_fhir_resource')
+            request = UpdateResourceRequest(
+                datastore_id=datastore_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                resource_data=resource_data,
+            )
+            result = await self.client.update_resource(
+                datastore_id=request.datastore_id,
+                resource_type=request.resource_type,
+                resource_id=request.resource_id,
+                resource_data=request.resource_data,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error updating FHIR resource: {e}')
+            return self._handle_error(e, 'update_fhir_resource')
+
+    async def delete_fhir_resource(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        resource_type: str = Field(..., description='FHIR resource type'),
+        resource_id: str = Field(..., description='FHIR resource ID'),
+    ) -> CallToolResult:
+        """Delete a FHIR resource from HealthLake."""
+        try:
+            self._check_write_access('delete_fhir_resource')
+            datastore_id = validate_datastore_id(datastore_id)
+            result = await self.client.delete_resource(
+                datastore_id=datastore_id, resource_type=resource_type, resource_id=resource_id
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error deleting FHIR resource: {e}')
+            return self._handle_error(e, 'delete_fhir_resource')
+
+    async def search_fhir_resources(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        resource_type: str = Field(
+            ..., description='FHIR resource type (e.g., Patient, Observation, Condition)'
+        ),
+        search_params: Optional[Dict[str, Any]] = Field(
+            None,
+            description="Basic FHIR search parameters. Supports modifiers (e.g., 'name:contains'), prefixes (e.g., 'birthdate': 'ge1990-01-01'), and simple chaining (e.g., 'subject:Patient')",
+        ),
+        chained_params: Optional[Dict[str, str]] = Field(
+            None,
+            description="Advanced chained search parameters. Key format: 'param.chain' or 'param:TargetType.chain' (e.g., {'subject.name': 'Smith', 'general-practitioner:Practitioner.name': 'Johnson'})",
+        ),
+        include_params: Optional[List[str]] = Field(
+            None,
+            description="Include related resources in the response. Format: 'ResourceType:parameter' or 'ResourceType:parameter:target-type' (e.g., ['Patient:general-practitioner', 'Observation:subject:Patient'])",
+        ),
+        revinclude_params: Optional[List[str]] = Field(
+            None,
+            description="Include resources that reference the found resources. Format: 'ResourceType:parameter' (e.g., ['Observation:subject', 'Condition:subject'])",
+        ),
+        count: int = Field(
+            100,
+            description='Maximum number of results to return (1-100, default: 100)',
+            ge=1,
+            le=100,
+        ),
+        next_token: Optional[str] = Field(
+            None,
+            description="Pagination token for retrieving the next page of results. Use the complete URL from a previous response's pagination.next_token field. When provided, other search parameters are ignored.",
+        ),
+    ) -> CallToolResult:
+        """Search for FHIR resources in HealthLake datastore with advanced search capabilities."""
+        try:
+            datastore_id = validate_datastore_id(datastore_id)
+            count = validate_count(count)
+            result = await self.client.search_resources(
+                datastore_id=datastore_id,
+                resource_type=resource_type,
+                search_params=search_params or {},
+                include_params=include_params,
+                revinclude_params=revinclude_params,
+                chained_params=chained_params,
+                count=count,
+                next_token=next_token,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error searching FHIR resources: {e}')
+            return self._handle_error(e, 'search_fhir_resources')
+
+    async def patient_everything(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        patient_id: str = Field(..., description='Patient resource ID'),
+        start: Optional[str] = Field(
+            None, description='Start date for filtering resources (YYYY-MM-DD format)'
+        ),
+        end: Optional[str] = Field(
+            None, description='End date for filtering resources (YYYY-MM-DD format)'
+        ),
+        count: int = Field(
+            100,
+            description='Maximum number of results to return (1-100, default: 100)',
+            ge=1,
+            le=100,
+        ),
+        next_token: Optional[str] = Field(
+            None,
+            description="Pagination token for retrieving the next page of results. Use the complete URL from a previous response's pagination.next_token field.",
+        ),
+    ) -> CallToolResult:
+        """Retrieve all resources related to a specific patient using the FHIR $patient-everything operation."""
+        try:
+            datastore_id = validate_datastore_id(datastore_id)
+            count = validate_count(count)
+            result = await self.client.patient_everything(
+                datastore_id=datastore_id,
+                patient_id=patient_id,
+                start=start,
+                end=end,
+                count=count,
+                next_token=next_token,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error getting patient everything: {e}')
+            return self._handle_error(e, 'patient_everything')
+
+    async def start_fhir_import_job(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        input_data_config: Dict[str, Any] = Field(..., description='Input data configuration'),
+        job_output_data_config: Dict[str, Any] = Field(
+            ..., description='Output data configuration (required for import jobs)'
+        ),
+        data_access_role_arn: str = Field(..., description='IAM role ARN for data access'),
+        job_name: Optional[str] = Field(None, description='Name for the import job'),
+    ) -> CallToolResult:
+        """Start a FHIR import job to load data into HealthLake."""
+        try:
+            self._check_write_access('start_fhir_import_job')
+            request = ImportJobConfig(
+                datastore_id=datastore_id,
+                input_data_config=input_data_config,
+                data_access_role_arn=data_access_role_arn,
+                job_name=job_name,
+            )
+            result = await self.client.start_import_job(
+                datastore_id=request.datastore_id,
+                input_data_config=request.input_data_config,
+                job_output_data_config=job_output_data_config,
+                data_access_role_arn=request.data_access_role_arn,
+                job_name=request.job_name,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error starting import job: {e}')
+            return self._handle_error(e, 'start_fhir_import_job')
+
+    async def start_fhir_export_job(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        output_data_config: Dict[str, Any] = Field(..., description='Output data configuration'),
+        data_access_role_arn: str = Field(..., description='IAM role ARN for data access'),
+        job_name: Optional[str] = Field(None, description='Name for the export job'),
+    ) -> CallToolResult:
+        """Start a FHIR export job to export data from HealthLake."""
+        try:
+            self._check_write_access('start_fhir_export_job')
+            request = ExportJobConfig(
+                datastore_id=datastore_id,
+                output_data_config=output_data_config,
+                data_access_role_arn=data_access_role_arn,
+                job_name=job_name,
+            )
+            result = await self.client.start_export_job(
+                datastore_id=request.datastore_id,
+                output_data_config=request.output_data_config,
+                data_access_role_arn=request.data_access_role_arn,
+                job_name=request.job_name,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error starting export job: {e}')
+            return self._handle_error(e, 'start_fhir_export_job')
+
+    async def list_fhir_jobs(
+        self,
+        ctx: Context,
+        datastore_id: str = Field(..., description='HealthLake datastore ID'),
+        job_status: Optional[str] = Field(
+            None,
+            description='Filter jobs by status (SUBMITTED, IN_PROGRESS, COMPLETED, FAILED, STOP_REQUESTED, STOPPED)',
+        ),
+        job_type: Optional[str] = Field(None, description='Type of job to list (IMPORT, EXPORT)'),
+    ) -> CallToolResult:
+        """List FHIR import/export jobs."""
+        try:
+            datastore_id = validate_datastore_id(datastore_id)
+            filter_obj = JobFilter(job_status=job_status, job_type=job_type)
+            result = await self.client.list_jobs(
+                datastore_id=datastore_id,
+                job_status=filter_obj.job_status,
+                job_type=filter_obj.job_type,
+            )
+            return create_success_response(result)
+        except Exception as e:
+            logger.error(f'Error listing jobs: {e}')
+            return self._handle_error(e, 'list_fhir_jobs')
+
+    def _handle_error(self, error: Exception, tool_name: str) -> CallToolResult:
+        """Handle errors and return appropriate error responses."""
+        if isinstance(error, (InputValidationError, ValueError)):
+            if 'read-only mode' in str(error):
+                logger.warning(f'Read-only mode violation attempt: {tool_name}')
+                return create_error_response(str(error), 'read_only_violation')
             else:
-                raise ValueError(f'Unknown tool: {name}')
-
-        handler = self.handlers[name]
-        result = await handler(arguments)
-        return create_success_response(result)
-
-    async def _handle_list_datastores(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        filter_obj = DatastoreFilter(**args)
-        return await self.client.list_datastores(filter_status=filter_obj.status)
-
-    async def _handle_get_datastore(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        datastore_id = validate_datastore_id(args['datastore_id'])
-
-        return await self.client.get_datastore_details(datastore_id=datastore_id)
-
-    async def _handle_create(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        if self.read_only:
-            raise ValueError('Create operation not allowed in read-only mode')
-
-        request = CreateResourceRequest(**args)
-
-        return await self.client.create_resource(
-            datastore_id=request.datastore_id,
-            resource_type=request.resource_type,
-            resource_data=request.resource_data,
-        )
-
-    async def _handle_read(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        datastore_id = validate_datastore_id(args['datastore_id'])
-
-        return await self.client.read_resource(
-            datastore_id=datastore_id,
-            resource_type=args['resource_type'],
-            resource_id=args['resource_id'],
-        )
-
-    async def _handle_update(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        if self.read_only:
-            raise ValueError('Update operation not allowed in read-only mode')
-
-        request = UpdateResourceRequest(**args)
-
-        return await self.client.update_resource(
-            datastore_id=request.datastore_id,
-            resource_type=request.resource_type,
-            resource_id=request.resource_id,
-            resource_data=request.resource_data,
-        )
-
-    async def _handle_delete(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        if self.read_only:
-            raise ValueError('Delete operation not allowed in read-only mode')
-
-        datastore_id = validate_datastore_id(args['datastore_id'])
-
-        return await self.client.delete_resource(
-            datastore_id=datastore_id,
-            resource_type=args['resource_type'],
-            resource_id=args['resource_id'],
-        )
-
-    async def _handle_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        datastore_id = validate_datastore_id(args['datastore_id'])
-
-        count = args.get('count', 100)
-        if count < 1 or count > MAX_SEARCH_COUNT:
-            raise ValueError(f'Count must be between 1 and {MAX_SEARCH_COUNT}')
-
-        return await self.client.search_resources(
-            datastore_id=datastore_id,
-            resource_type=args['resource_type'],
-            search_params=args.get('search_params', {}),
-            include_params=args.get('include_params'),
-            revinclude_params=args.get('revinclude_params'),
-            chained_params=args.get('chained_params'),
-            count=count,
-            next_token=args.get('next_token'),
-        )
-
-    async def _handle_patient_everything(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        datastore_id = validate_datastore_id(args['datastore_id'])
-
-        count = args.get('count', 100)
-        if count < 1 or count > MAX_SEARCH_COUNT:
-            raise ValueError(f'Count must be between 1 and {MAX_SEARCH_COUNT}')
-
-        return await self.client.patient_everything(
-            datastore_id=datastore_id,
-            patient_id=args['patient_id'],
-            start=args.get('start'),
-            end=args.get('end'),
-            count=count,
-            next_token=args.get('next_token'),
-        )
-
-    async def _handle_import_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        if self.read_only:
-            raise ValueError('Import job operation not allowed in read-only mode')
-
-        request = ImportJobConfig(**args)
-
-        return await self.client.start_import_job(
-            datastore_id=request.datastore_id,
-            input_data_config=request.input_data_config,
-            job_output_data_config=args['job_output_data_config'],
-            data_access_role_arn=request.data_access_role_arn,
-            job_name=request.job_name,
-        )
-
-    async def _handle_export_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        if self.read_only:
-            raise ValueError('Export job operation not allowed in read-only mode')
-
-        request = ExportJobConfig(**args)
-
-        return await self.client.start_export_job(
-            datastore_id=request.datastore_id,
-            output_data_config=request.output_data_config,
-            data_access_role_arn=request.data_access_role_arn,
-            job_name=request.job_name,
-        )
-
-    async def _handle_list_jobs(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        datastore_id = validate_datastore_id(args['datastore_id'])
-
-        filter_obj = JobFilter(job_status=args.get('job_status'), job_type=args.get('job_type'))
-
-        return await self.client.list_jobs(
-            datastore_id=datastore_id,
-            job_status=filter_obj.job_status,
-            job_type=filter_obj.job_type,
-        )
-
-
-def create_healthlake_server(read_only: bool = False) -> Server:
-    """Create and configure the HealthLake MCP server."""
-    server = Server('healthlake-mcp-server')
-    healthlake_client = HealthLakeClient()
-    tool_handler = ToolHandler(healthlake_client, read_only=read_only)
-
-    @server.list_tools()
-    async def handle_list_tools() -> List[Tool]:
-        """List available HealthLake tools based on mode."""
-        # Define all tools
-        all_tools = [
-            # Datastore Management (foundational operations)
-            Tool(
-                name='list_datastores',
-                description='List all HealthLake datastores in the account',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'filter': {
-                            'type': 'string',
-                            'description': 'Filter datastores by status (CREATING, ACTIVE, DELETING, DELETED)',
-                            'enum': ['CREATING', 'ACTIVE', 'DELETING', 'DELETED'],
-                        }
-                    },
-                },
-            ),
-            Tool(
-                name='get_datastore_details',
-                description='Get detailed information about a specific HealthLake datastore',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        }
-                    },
-                    'required': ['datastore_id'],
-                },
-            ),
-            # CRUD Operations (core functionality)
-            Tool(
-                name='create_fhir_resource',
-                description='Create a new FHIR resource in HealthLake',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'resource_type': {'type': 'string', 'description': 'FHIR resource type'},
-                        'resource_data': {
-                            'type': 'object',
-                            'description': 'FHIR resource data as JSON object',
-                        },
-                    },
-                    'required': ['datastore_id', 'resource_type', 'resource_data'],
-                },
-            ),
-            Tool(
-                name='read_fhir_resource',
-                description='Get a specific FHIR resource by ID',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'resource_type': {'type': 'string', 'description': 'FHIR resource type'},
-                        'resource_id': {'type': 'string', 'description': 'FHIR resource ID'},
-                    },
-                    'required': ['datastore_id', 'resource_type', 'resource_id'],
-                },
-            ),
-            Tool(
-                name='update_fhir_resource',
-                description='Update an existing FHIR resource in HealthLake',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'resource_type': {'type': 'string', 'description': 'FHIR resource type'},
-                        'resource_id': {'type': 'string', 'description': 'FHIR resource ID'},
-                        'resource_data': {
-                            'type': 'object',
-                            'description': 'Updated FHIR resource data as JSON object',
-                        },
-                    },
-                    'required': ['datastore_id', 'resource_type', 'resource_id', 'resource_data'],
-                },
-            ),
-            Tool(
-                name='delete_fhir_resource',
-                description='Delete a FHIR resource from HealthLake',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'resource_type': {'type': 'string', 'description': 'FHIR resource type'},
-                        'resource_id': {'type': 'string', 'description': 'FHIR resource ID'},
-                    },
-                    'required': ['datastore_id', 'resource_type', 'resource_id'],
-                },
-            ),
-            # Advanced Search Operations
-            Tool(
-                name='search_fhir_resources',
-                description='Search for FHIR resources in HealthLake datastore with advanced search capabilities. Returns up to 100 results per call. If pagination.has_next is true, call this tool again with the next_token to get more results.',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'resource_type': {
-                            'type': 'string',
-                            'description': 'FHIR resource type (e.g., Patient, Observation, Condition)',
-                        },
-                        'search_params': {
-                            'type': 'object',
-                            'description': "Basic FHIR search parameters. Supports modifiers (e.g., 'name:contains'), prefixes (e.g., 'birthdate': 'ge1990-01-01'), and simple chaining (e.g., 'subject:Patient')",
-                            'additionalProperties': True,
-                        },
-                        'chained_params': {
-                            'type': 'object',
-                            'description': "Advanced chained search parameters. Key format: 'param.chain' or 'param:TargetType.chain' (e.g., {'subject.name': 'Smith', 'general-practitioner:Practitioner.name': 'Johnson'})",
-                            'additionalProperties': {'type': 'string'},
-                        },
-                        'include_params': {
-                            'type': 'array',
-                            'description': "Include related resources in the response. Format: 'ResourceType:parameter' or 'ResourceType:parameter:target-type' (e.g., ['Patient:general-practitioner', 'Observation:subject:Patient'])",
-                            'items': {'type': 'string'},
-                        },
-                        'revinclude_params': {
-                            'type': 'array',
-                            'description': "Include resources that reference the found resources. Format: 'ResourceType:parameter' (e.g., ['Observation:subject', 'Condition:subject'])",
-                            'items': {'type': 'string'},
-                        },
-                        'count': {
-                            'type': 'integer',
-                            'description': 'Maximum number of results to return (1-100, default: 100)',
-                            'minimum': 1,
-                            'maximum': 100,
-                            'default': 100,
-                        },
-                        'next_token': {
-                            'type': 'string',
-                            'description': "Pagination token for retrieving the next page of results. Use the complete URL from a previous response's pagination.next_token field. When provided, other search parameters are ignored.",
-                        },
-                    },
-                    'required': ['datastore_id', 'resource_type'],
-                },
-            ),
-            Tool(
-                name='patient_everything',
-                description='Retrieve all resources related to a specific patient using the FHIR $patient-everything operation',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'patient_id': {'type': 'string', 'description': 'Patient resource ID'},
-                        'start': {
-                            'type': 'string',
-                            'description': 'Start date for filtering resources (YYYY-MM-DD format)',
-                        },
-                        'end': {
-                            'type': 'string',
-                            'description': 'End date for filtering resources (YYYY-MM-DD format)',
-                        },
-                        'count': {
-                            'type': 'integer',
-                            'description': 'Maximum number of results to return (1-100, default: 100)',
-                            'minimum': 1,
-                            'maximum': 100,
-                            'default': 100,
-                        },
-                        'next_token': {
-                            'type': 'string',
-                            'description': "Pagination token for retrieving the next page of results. Use the complete URL from a previous response's pagination.next_token field.",
-                        },
-                    },
-                    'required': ['datastore_id', 'patient_id'],
-                },
-            ),
-            # Job Management Operations
-            Tool(
-                name='start_fhir_import_job',
-                description='Start a FHIR import job to load data into HealthLake',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'input_data_config': {
-                            'type': 'object',
-                            'description': 'Input data configuration',
-                            'properties': {
-                                's3_uri': {
-                                    'type': 'string',
-                                    'description': 'S3 URI containing FHIR data',
-                                }
-                            },
-                            'required': ['s3_uri'],
-                        },
-                        'job_output_data_config': {
-                            'type': 'object',
-                            'description': 'Output data configuration (required for import jobs)',
-                            'properties': {
-                                's3_configuration': {
-                                    'type': 'object',
-                                    'properties': {
-                                        's3_uri': {
-                                            'type': 'string',
-                                            'description': 'S3 URI for job output/logs',
-                                        },
-                                        'kms_key_id': {
-                                            'type': 'string',
-                                            'description': 'KMS key ID for encryption (optional)',
-                                        },
-                                    },
-                                    'required': ['s3_uri'],
-                                }
-                            },
-                            'required': ['s3_configuration'],
-                        },
-                        'data_access_role_arn': {
-                            'type': 'string',
-                            'description': 'IAM role ARN for data access',
-                        },
-                        'job_name': {'type': 'string', 'description': 'Name for the import job'},
-                    },
-                    'required': [
-                        'datastore_id',
-                        'input_data_config',
-                        'job_output_data_config',
-                        'data_access_role_arn',
-                    ],
-                },
-            ),
-            Tool(
-                name='start_fhir_export_job',
-                description='Start a FHIR export job to export data from HealthLake',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'output_data_config': {
-                            'type': 'object',
-                            'description': 'Output data configuration',
-                            'properties': {
-                                's3_configuration': {
-                                    'type': 'object',
-                                    'properties': {
-                                        's3_uri': {
-                                            'type': 'string',
-                                            'description': 'S3 URI for export destination',
-                                        },
-                                        'kms_key_id': {
-                                            'type': 'string',
-                                            'description': 'KMS key ID for encryption',
-                                        },
-                                    },
-                                    'required': ['s3_uri'],
-                                }
-                            },
-                            'required': ['s3_configuration'],
-                        },
-                        'data_access_role_arn': {
-                            'type': 'string',
-                            'description': 'IAM role ARN for data access',
-                        },
-                        'job_name': {'type': 'string', 'description': 'Name for the export job'},
-                    },
-                    'required': ['datastore_id', 'output_data_config', 'data_access_role_arn'],
-                },
-            ),
-            Tool(
-                name='list_fhir_jobs',
-                description='List FHIR import/export jobs',
-                inputSchema={
-                    'type': 'object',
-                    'properties': {
-                        'datastore_id': {
-                            'type': 'string',
-                            'description': 'HealthLake datastore ID',
-                        },
-                        'job_status': {
-                            'type': 'string',
-                            'description': 'Filter jobs by status',
-                            'enum': [
-                                'SUBMITTED',
-                                'IN_PROGRESS',
-                                'COMPLETED',
-                                'FAILED',
-                                'STOP_REQUESTED',
-                                'STOPPED',
-                            ],
-                        },
-                        'job_type': {
-                            'type': 'string',
-                            'description': 'Type of job to list',
-                            'enum': ['IMPORT', 'EXPORT'],
-                        },
-                    },
-                    'required': ['datastore_id'],
-                },
-            ),
-        ]
-
-        # Filter tools based on read-only mode
-        if read_only:
-            return [tool for tool in all_tools if tool.name in READ_ONLY_TOOLS]
+                logger.warning(f'Validation error in {tool_name}: {error}')
+                return create_error_response(str(error), 'validation_error')
+        elif isinstance(error, ClientError):
+            error_code = error.response['Error']['Code']
+            logger.error(f'AWS error in {tool_name}: {error_code}')
+            errors = {
+                'ResourceNotFoundException': ('Resource not found', 'not_found'),
+                'ValidationException': (
+                    f'Invalid parameters: {error.response["Error"]["Message"]}',
+                    'validation_error',
+                ),
+            }
+            msg, typ = errors.get(error_code, ('AWS service error', 'service_error'))
+            return create_error_response(msg, typ)
+        elif isinstance(error, NoCredentialsError):
+            logger.error(f'Credentials error in {tool_name}')
+            return create_error_response('AWS credentials not configured', 'auth_error')
         else:
-            return all_tools
+            logger.exception('Unexpected error in tool call', tool=tool_name)
+            return create_error_response('Internal server error', 'server_error')
 
-    @server.list_resources()
-    async def handle_list_resources() -> List[Resource]:
+
+def create_server():
+    """Create and configure the MCP server instance."""
+    return FastMCP(
+        'awslabs.healthlake-mcp-server',
+        instructions=SERVER_INSTRUCTIONS,
+        dependencies=SERVER_DEPENDENCIES,
+    )
+
+
+def create_healthlake_server(read_only: bool = False) -> FastMCP:
+    """Create and configure the HealthLake MCP server."""
+    mcp = create_server()
+
+    # Initialize handler
+    HealthLakeHandler(mcp, read_only=read_only)
+
+    # Register resources handler
+    @mcp.list_resources()
+    async def list_resources() -> List[Resource]:
         """List available HealthLake datastores as discoverable resources."""
         try:
+            healthlake_client = HealthLakeClient()
             response = await healthlake_client.list_datastores()
             return [
                 Resource(
@@ -614,52 +552,34 @@ def create_healthlake_server(read_only: bool = False) -> Server:
             logger.error(f'Error listing datastore resources: {e}')
             return []
 
-    @server.read_resource()
-    async def handle_read_resource(uri: AnyUrl) -> str:
-        """Read detailed datastore information."""
-        uri_str = str(uri)
-        if not uri_str.startswith('healthlake://datastore/'):
-            raise ValueError(f'Unknown resource URI: {uri_str}')
-        datastore_id = uri_str.split('/')[-1]
-        return json.dumps(
-            await healthlake_client.get_datastore_details(datastore_id),
-            indent=2,
-            cls=DateTimeEncoder,
-        )
+    return mcp
 
-    @server.call_tool()
-    async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> Sequence[TextContent]:
-        """Handle tool calls using dispatch pattern."""
-        try:
-            return await tool_handler.handle_tool(name, arguments)
-        except (InputValidationError, ValueError) as e:
-            if 'read-only mode' in str(e):
-                logger.warning(f'Read-only mode violation attempt: {name}')
-                return create_error_response(
-                    f'Operation {name} not available in read-only mode. '
-                    'Remove --readonly flag to enable write operations.',
-                    'read_only_violation',
-                )
-            else:
-                logger.warning(f'Validation error in {name}: {e}')
-                return create_error_response(str(e), 'validation_error')
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            logger.error(f'AWS error in {name}: {error_code}')
-            errors = {
-                'ResourceNotFoundException': ('Resource not found', 'not_found'),
-                'ValidationException': (
-                    f'Invalid parameters: {e.response["Error"]["Message"]}',
-                    'validation_error',
-                ),
-            }
-            msg, typ = errors.get(error_code, ('AWS service error', 'service_error'))
-            return create_error_response(msg, typ)
-        except NoCredentialsError:
-            logger.error(f'Credentials error in {name}')
-            return create_error_response('AWS credentials not configured', 'auth_error')
-        except Exception:
-            logger.exception('Unexpected error in tool call', tool=name)
-            return create_error_response('Internal server error', 'server_error')
 
-    return server
+def main():
+    """Run the MCP server with CLI argument support."""
+    parser = argparse.ArgumentParser(
+        description='An AWS Labs Model Context Protocol (MCP) server for HealthLake'
+    )
+    parser.add_argument(
+        '--readonly',
+        action='store_true',
+        help='Enable read-only mode (blocks all mutating operations)',
+    )
+
+    args = parser.parse_args()
+
+    # Log startup mode
+    if args.readonly:
+        logger.info('Starting HealthLake MCP Server in read-only mode')
+    else:
+        logger.info('Starting HealthLake MCP Server with write access enabled')
+
+    # Create and run the server
+    mcp = create_healthlake_server(read_only=args.readonly)
+    mcp.run()
+
+    return mcp
+
+
+if __name__ == '__main__':
+    main()

@@ -1168,7 +1168,7 @@
     },
     {
       "category": "Healthcare & Lifesciences",
-      "description": "Comprehensive medical imaging data lifecycle management with AWS HealthImaging - 21 tools for DICOM operations, datastore management, and patient data handling",
+      "description": "Comprehensive medical imaging data lifecycle management with AWS HealthImaging - 39 tools for DICOM operations, datastore management, patient data handling, and advanced medical imaging workflows",
       "icon": "\ud83c\udfe5",
       "id": "healthimaging-mcp-server",
       "name": "HealthImaging MCP Server",

@@ -1,17 +1,26 @@
 # AWS HealthImaging MCP Server
 
-A comprehensive Model Context Protocol (MCP) server for AWS HealthImaging operations. Provides **21 tools** for complete medical imaging data lifecycle management with automatic datastore discovery.
+A comprehensive Model Context Protocol (MCP) server for AWS HealthImaging operations. Provides **39 tools** for complete medical imaging data lifecycle management with automatic datastore discovery and advanced DICOM operations.
 
 ## Features
 
-- **21 Comprehensive HealthImaging Tools**: Complete medical imaging data lifecycle management
-- **Delete Operations**: Patient data removal, study deletion, GDPR compliance
+- **39 Comprehensive HealthImaging Tools**: Complete medical imaging data lifecycle management
+- **21 Standard AWS API Operations**: Full AWS HealthImaging API coverage including datastore management, import/export jobs, image sets, metadata, and resource tagging
+- **18 Advanced DICOM Operations**: Specialized medical imaging workflows including patient/study/series level operations, bulk operations, and DICOM hierarchy management
+- **Delete Operations**: Patient data removal, study deletion, supports compliance with "right to be forgotten/right to erasure" GDPR objectives
+- **Metadata Updates**: Patient corrections, study modifications, series/instance management
+- **Enhanced Search**: Patient-focused, study-focused, and series-focused searches with DICOM-aware filtering
+- **Data Analysis**: Patient studies overview, series analysis, primary image set filtering, DICOMweb integration
+- **Bulk Operations**: Efficient large-scale metadata updates and deletions with safety limits
+- **DICOM Hierarchy Operations**: Series and instance removal with deep DICOM knowledge
+- **Import/Export Jobs**: Complete DICOM data import and export workflow management
 - **Automatic Datastore Discovery**: Seamlessly find and work with existing datastores
-- **DICOM Metadata Operations**: Extract and analyze medical imaging metadata
+- **DICOM Metadata Operations**: Extract and analyze medical imaging metadata with base64 encoding for binary data
 - **Image Frame Management**: Retrieve and process individual image frames
-- **Search Capabilities**: Advanced search across image sets and studies
-- **Error Handling**: Comprehensive error handling with detailed feedback
-- **Type Safety**: Full type annotations and validation
+- **AWS Integration**: SigV4 authentication with automatic credential handling
+- **Error Handling**: Structured error responses with specific error types
+- **Docker Support**: Production-ready containerization
+- **Type Safety**: Comprehensive Pydantic models for all operations
 
 ## Quick Start
 
@@ -78,30 +87,66 @@ For other MCP clients like Claude Desktop, add this to your configuration:
 
 ## Available Tools
 
-### Datastore Management
-- `list_datastores` - List all HealthImaging datastores
-- `get_datastore` - Get detailed datastore information
-- `create_datastore` - Create new datastore
+### Datastore Management (4 tools)
+- `create_datastore` - Create new datastore with encryption options
 - `delete_datastore` - Delete datastore (with safety checks)
+- `get_datastore` - Get detailed datastore information and endpoints
+- `list_datastores` - Discover available datastores with status filtering
 
-### Image Set Operations
-- `list_image_sets` - List image sets with filtering
-- `get_image_set` - Get detailed image set information
-- `search_image_sets` - Advanced search across image sets
+### Image Set Operations (7 tools)
+- `search_image_sets` - Advanced DICOM search with pagination
+- `get_image_set` - Individual image set metadata
+- `get_image_set_metadata` - Detailed DICOM metadata extraction with base64 encoding
+- `list_image_set_versions` - Version history management
+- `update_image_set_metadata` - DICOM metadata corrections
+- `delete_image_set` - Individual image set deletion
 - `copy_image_set` - Copy image sets between datastores
-- `update_image_set_metadata` - Update image set metadata
-- `delete_image_set` - Delete image sets (with safety checks)
 
-### Image Frame Operations
-- `get_image_frame` - Retrieve individual image frames
-- `get_image_set_metadata` - Extract DICOM metadata
-- `list_dicom_import_jobs` - List import job status
-- `get_dicom_import_job` - Get import job details
+### Image Frame Operations (1 tool)
+- `get_image_frame` - Frame-level access with base64 encoding
+
+### DICOM Import/Export Jobs (6 tools)
 - `start_dicom_import_job` - Start new import jobs
+- `get_dicom_import_job` - Get import job details and status
+- `list_dicom_import_jobs` - List import job status with filtering
+- `start_dicom_export_job` - Start new export jobs
+- `get_dicom_export_job` - Get export job details and status
+- `list_dicom_export_jobs` - List export job status with filtering
 
-### MCP Resources
-- `list_mcp_resources` - List available MCP resources
-- `get_mcp_resource` - Get specific resource details
+### Resource Tagging (3 tools)
+- `list_tags_for_resource` - List tags for HealthImaging resources
+- `tag_resource` - Add tags to resources
+- `untag_resource` - Remove tags from resources
+
+### Enhanced Search Operations (3 tools)
+- `search_by_patient_id` - Patient-focused clinical workflows
+- `search_by_study_uid` - Study-centric analysis
+- `search_by_series_uid` - Series-level investigations
+
+### Data Analysis Operations (3 tools)
+- `get_patient_studies` - Comprehensive patient study overview
+- `get_patient_series` - Series-level analysis for patients
+- `get_study_primary_image_sets` - Primary data identification
+
+### Delete Operations (5 tools)
+- `delete_patient_studies` - Complete patient data removal
+- `delete_study` - Study-level deletion by UID
+- `delete_series_by_uid` - Series deletion using metadata updates
+- `delete_instance_in_study` - Delete specific instance in study
+- `delete_instance_in_series` - Delete specific instance in series
+
+### Metadata Update Operations (3 tools)
+- `get_series_primary_image_set` - Get primary image set for series
+- `get_patient_dicomweb_studies` - Get DICOMweb study-level info
+- `update_patient_study_metadata` - Update Patient/Study metadata
+
+### Bulk Operations (2 tools)
+- `bulk_update_patient_metadata` - Mass patient data corrections
+- `bulk_delete_by_criteria` - Criteria-based bulk deletion
+
+### DICOM Hierarchy Operations (2 tools)
+- `remove_series_from_image_set` - Series-level data management
+- `remove_instance_from_image_set` - Instance-level precision removal
 
 ## Usage Examples
 
@@ -125,6 +170,29 @@ results = await search_image_sets(
             }
         ]
     }
+)
+```
+
+### Advanced DICOM Operations
+
+```python
+# Delete all studies for a patient
+await delete_patient_studies(
+    datastore_id="12345678901234567890123456789012",
+    patient_id="PATIENT123"
+)
+
+# Get comprehensive patient study overview
+studies = await get_patient_studies(
+    datastore_id="12345678901234567890123456789012",
+    patient_id="PATIENT123"
+)
+
+# Bulk update patient metadata
+await bulk_update_patient_metadata(
+    datastore_id="12345678901234567890123456789012",
+    patient_id="PATIENT123",
+    metadata_updates={"PatientName": "Updated Name"}
 )
 ```
 
@@ -186,19 +254,45 @@ Your AWS credentials need the following permissions:
                 "medical-imaging:GetDatastore",
                 "medical-imaging:CreateDatastore",
                 "medical-imaging:DeleteDatastore",
-                "medical-imaging:ListImageSets",
-                "medical-imaging:GetImageSet",
                 "medical-imaging:SearchImageSets",
-                "medical-imaging:CopyImageSet",
+                "medical-imaging:GetImageSet",
+                "medical-imaging:GetImageSetMetadata",
+                "medical-imaging:ListImageSetVersions",
                 "medical-imaging:UpdateImageSetMetadata",
                 "medical-imaging:DeleteImageSet",
+                "medical-imaging:CopyImageSet",
                 "medical-imaging:GetImageFrame",
-                "medical-imaging:GetImageSetMetadata",
-                "medical-imaging:ListDICOMImportJobs",
+                "medical-imaging:StartDICOMImportJob",
                 "medical-imaging:GetDICOMImportJob",
-                "medical-imaging:StartDICOMImportJob"
+                "medical-imaging:ListDICOMImportJobs",
+                "medical-imaging:StartDICOMExportJob",
+                "medical-imaging:GetDICOMExportJob",
+                "medical-imaging:ListDICOMExportJobs",
+                "medical-imaging:ListTagsForResource",
+                "medical-imaging:TagResource",
+                "medical-imaging:UntagResource"
             ],
             "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::your-import-bucket/*",
+                "arn:aws:s3:::your-export-bucket/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "kms:Decrypt",
+                "kms:GenerateDataKey"
+            ],
+            "Resource": "arn:aws:kms:*:*:key/*"
         }
     ]
 }
@@ -269,7 +363,7 @@ uv run python -m awslabs.healthimaging_mcp_server
 
 ### Testing
 
-The server includes comprehensive tests with 99% coverage:
+The server includes comprehensive tests with 91% coverage:
 
 ```bash
 # Run all tests
